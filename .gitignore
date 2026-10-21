@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Xcode / Swift
+.build/
+DerivedData/
+*.xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec.bak
+
+# PyInstaller
+windows-build/mediatel-gui/build/
+windows-build/mediatel-gui/dist/
+windows-build/mediatel-cli/build/
+windows-build/mediatel-cli/dist/
+windows-build/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+ehthumbs.db

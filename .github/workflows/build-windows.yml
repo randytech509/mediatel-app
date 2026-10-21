@@ -1,0 +1,118 @@
+# ═══════════════════════════════════════════════════════════════
+#  RANDROID — Mediatel Windows Build (GitHub Actions)
+#  Automatically builds Windows .exe files on push/tag
+# ═══════════════════════════════════════════════════════════════
+
+name: Build Windows Executables
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  build-windows:
+    name: Build Windows EXEs
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install PyInstaller
+      run: pip install pyinstaller
+
+    - name: Build Mediatel GUI
+      run: |
+        cd Sources/Mediatel/windows-build/mediatel-gui
+        pyinstaller --onefile --windowed --name "Mediatel" `
+          --exclude-module matplotlib --exclude-module numpy `
+          --exclude-module pandas --exclude-module scipy `
+          --exclude-module PIL --exclude-module cv2 `
+          mediatel_gui.py
+
+    - name: Build Mediatel CLI
+      run: |
+        cd Sources/Mediatel/windows-build/mediatel-cli
+        pyinstaller --onefile --console --name "mediatel-cli" `
+          --exclude-module tkinter --exclude-module matplotlib `
+          --exclude-module numpy --exclude-module pandas `
+          --exclude-module scipy --exclude-module PIL `
+          mediatel_cli.py
+
+    - name: Collect artifacts
+      run: |
+        mkdir -p artifacts
+        cp Sources/Mediatel/windows-build/mediatel-gui/dist/Mediatel.exe artifacts/
+        cp Sources/Mediatel/windows-build/mediatel-cli/dist/mediatel-cli.exe artifacts/
+      shell: bash
+
+    - name: Upload Mediatel GUI
+      uses: actions/upload-artifact@v4
+      with:
+        name: Mediatel-GUI-Windows
+        path: artifacts/Mediatel.exe
+
+    - name: Upload Mediatel CLI
+      uses: actions/upload-artifact@v4
+      with:
+        name: Mediatel-CLI-Windows
+        path: artifacts/mediatel-cli.exe
+
+    - name: Upload All
+      uses: actions/upload-artifact@v4
+      with:
+        name: Mediatel-Windows-Bundle
+        path: artifacts/
+
+  # Auto-create GitHub Release on version tags
+  release:
+    name: Create Release
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: Mediatel-Windows-Bundle
+        path: release/
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: "Mediatel ${{ github.ref_name }}"
+        body: |
+          ## RANDROID — Mediatel ${{ github.ref_name }}
+
+          ### Downloads
+          - **Mediatel.exe** — GUI desktop app for Android device management
+          - **mediatel-cli.exe** — Command-line interface
+
+          ### Requirements
+          - Windows 10/11 (64-bit)
+          - ADB (Android Debug Bridge) in PATH or Android SDK installed
+          - USB debugging enabled on your Android device
+
+          ### Usage
+          **GUI:** Double-click `Mediatel.exe`
+          **CLI:** Open Command Prompt and run `mediatel-cli.exe --help`
+
+          ---
+          *RandyTech Solutions © 2024-2026*
+        files: |
+          release/Mediatel.exe
+          release/mediatel-cli.exe
+        draft: false
+        prerelease: false
