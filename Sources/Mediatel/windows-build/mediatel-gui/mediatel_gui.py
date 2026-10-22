@@ -6,19 +6,18 @@ Windows desktop application for Android device management via ADB.
 Built with tkinter (ships with Python — no extra dependencies).
 
 Features:
-  • Device listing and selection
-  • File browser with table view
-  • Push/Pull files with progress bar
+  • Device listing and selection with live status
+  • File browser with table view, icons, and human-readable sizes
+  • Push/Pull files with progress tracking
   • Rename, Delete, New Folder operations
-  • Firmware flash (Heimdall / Odin4)
-  • Context menus for all operations
+  • Full Firmware flash suite (Heimdall & Odin4) with partition manager
+  • Context menus for all file operations
 
 RandyTech Solutions © 2024-2026
 """
 
 import os
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -26,90 +25,21 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from pathlib import Path
 
+# Add parent directory to sys.path to load mediatel_core
+_parent = str(Path(__file__).resolve().parent.parent)
+if _parent not in sys.path:
+    sys.path.insert(0, _parent)
 
-# ─── Shell Helpers ────────────────────────────────────────────────────────────
-
-def find_adb() -> str:
-    """Locate adb.exe on Windows."""
-    adb = shutil.which("adb")
-    if adb:
-        return adb
-    candidates = [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Android" / "Sdk" / "platform-tools" / "adb.exe",
-        Path(os.environ.get("USERPROFILE", "")) / "AppData" / "Local" / "Android" / "Sdk" / "platform-tools" / "adb.exe",
-        Path("C:/Android/Sdk/platform-tools/adb.exe"),
-        Path("C:/Program Files/Android/platform-tools/adb.exe"),
-        Path("C:/platform-tools/adb.exe"),
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return "adb"
-
-
-ADB = find_adb()
-
-CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-
-
-def run_cmd(args, timeout=120):
-    """Run command, return (code, stdout, stderr)."""
-    try:
-        p = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        return p.returncode, p.stdout, p.stderr
-    except FileNotFoundError:
-        return 127, "", f"Not found: {args[0]}"
-    except subprocess.TimeoutExpired:
-        return 1, "", "Command timed out"
-
-
-def adb_cmd(*args, serial=None, timeout=120):
-    """Run ADB command."""
-    cmd = [ADB]
-    if serial:
-        cmd += ["-s", serial]
-    cmd += list(args)
-    return run_cmd(cmd, timeout=timeout)
-
-
-# ─── Data Helpers ─────────────────────────────────────────────────────────────
-
-def parse_ls(output):
-    """Parse ls -AlL output into list of dicts."""
-    entries = []
-    for raw in output.split("\n"):
-        line = raw.strip()
-        if not line or line.startswith("total "):
-            continue
-        parts = line.split(None, 7)
-        if len(parts) < 8:
-            continue
-        perm, _, _, _, size_str, date_part, time_part, name = parts
-        is_dir = perm.startswith("d")
-        is_link = perm.startswith("l")
-        if is_link and " -> " in name:
-            name = name.split(" -> ")[0]
-        size = 0 if (is_dir or is_link) else int(size_str or "0")
-        entries.append({
-            "name": name,
-            "is_dir": is_dir or is_link,
-            "size": size,
-            "date": f"{date_part} {time_part}",
-        })
-    entries.sort(key=lambda e: (0 if e["is_dir"] else 1, e["name"].lower()))
-    return entries
-
-
-def human_size(n):
-    v = float(n)
-    for u in ["B", "KB", "MB", "GB", "TB"]:
-        if v < 1024:
-            return f"{int(v)} {u}" if u == "B" else f"{v:.1f} {u}"
-        v /= 1024
-    return f"{v:.1f} PB"
+from mediatel_core import (
+    find_adb,
+    find_tool,
+    human_size,
+    parse_devices,
+    parse_ls,
+    run_adb,
+    run_command,
+    sh_quote,
+)
 
 
 # ─── Color Theme ──────────────────────────────────────────────────────────────
@@ -166,8 +96,8 @@ class MediatelApp(tk.Tk):
         style.configure("Dim.TLabel", background=COLORS["bg"], foreground=COLORS["fg_dim"])
         style.configure("SidebarDim.TLabel", background=COLORS["bg_sidebar"], foreground=COLORS["fg_dim"])
         style.configure("Accent.TLabel", background=COLORS["bg"], foreground=COLORS["accent"])
-        style.configure("Green.TLabel", foreground=COLORS["green"], background=COLORS["bg_sidebar"])
-        style.configure("Orange.TLabel", foreground=COLORS["orange"], background=COLORS["bg_sidebar"])
+        style.configure("Green.TLabel", foreground=COLORS["green"], background=COLORS["bg"])
+        style.configure("Orange.TLabel", foreground=COLORS["orange"], background=COLORS["bg"])
         style.configure("TButton", background=COLORS["surface"], foreground=COLORS["fg"],
                          padding=(12, 6), borderwidth=1, relief="flat")
         style.map("TButton",
@@ -188,6 +118,12 @@ class MediatelApp(tk.Tk):
                    foreground=[("selected", COLORS["accent"])])
         style.configure("Horizontal.TProgressbar", background=COLORS["accent"],
                          troughcolor=COLORS["surface"], borderwidth=0, thickness=8)
+        style.configure("TNotebook", background=COLORS["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", background=COLORS["surface"], foreground=COLORS["fg"],
+                         padding=(12, 6), borderwidth=0)
+        style.map("TNotebook.Tab",
+                   background=[("selected", COLORS["accent"]), ("active", COLORS["surface"])],
+                   foreground=[("selected", COLORS["bg"]), ("active", COLORS["fg"])])
 
     def _build_ui(self):
         # Main container
@@ -221,7 +157,7 @@ class MediatelApp(tk.Tk):
         )
         self.device_hint.pack(pady=20)
 
-        # Brand
+        # Brand footer
         ttk.Label(sidebar, text="RANDROID", font=("Segoe UI", 9, "bold"),
                   style="SidebarDim.TLabel").pack(side=tk.BOTTOM, pady=(0, 4))
         ttk.Label(sidebar, text="RandyTech Solutions",
@@ -242,7 +178,7 @@ class MediatelApp(tk.Tk):
         ttk.Button(toolbar, text="📁 New Folder", command=self._new_folder).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="⟳", width=3, command=self._list_path).pack(side=tk.LEFT, padx=2)
 
-        # Progress bar (hidden by default)
+        # Progress bar
         self.progress_frame = ttk.Frame(toolbar)
         self.progress_frame.pack(side=tk.RIGHT, padx=4)
         self.progress_bar = ttk.Progressbar(self.progress_frame, style="Horizontal.TProgressbar",
@@ -256,8 +192,7 @@ class MediatelApp(tk.Tk):
         ttk.Button(path_bar, text="⬆", width=3, command=self._go_up).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Label(path_bar, text="📂", font=("Segoe UI", 11)).pack(side=tk.LEFT, padx=(0, 4))
         self.path_var = tk.StringVar(value=self.current_path)
-        self.path_entry = ttk.Entry(path_bar, textvariable=self.path_var,
-                                     font=("Consolas", 11))
+        self.path_entry = ttk.Entry(path_bar, textvariable=self.path_var, font=("Consolas", 11))
         self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.path_entry.bind("<Return>", self._on_path_enter)
 
@@ -273,10 +208,10 @@ class MediatelApp(tk.Tk):
         self.tree.heading("name", text="Name")
         self.tree.heading("size", text="Size")
         self.tree.heading("date", text="Modified")
-        self.tree.column("type", width=30, minwidth=30, stretch=False, anchor=tk.CENTER)
-        self.tree.column("name", width=350, minwidth=200)
+        self.tree.column("type", width=32, minwidth=32, stretch=False, anchor=tk.CENTER)
+        self.tree.column("name", width=380, minwidth=200)
         self.tree.column("size", width=100, minwidth=80, anchor=tk.E)
-        self.tree.column("date", width=140, minwidth=120)
+        self.tree.column("date", width=150, minwidth=120)
 
         scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -284,9 +219,9 @@ class MediatelApp(tk.Tk):
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.tree.bind("<Double-1>", self._on_double_click)
-        self.tree.bind("<Button-3>", self._on_right_click)  # Windows right-click
+        self.tree.bind("<Button-3>", self._on_right_click)
 
-        # Notice label (shown when no device connected)
+        # Notice label (when no device selected or unauthorized)
         self.notice_label = ttk.Label(
             detail, text="No device selected.",
             style="Dim.TLabel", font=("Segoe UI", 12), anchor=tk.CENTER
@@ -305,20 +240,8 @@ class MediatelApp(tk.Tk):
 
     def _refresh_devices(self):
         def _work():
-            code, out, err = adb_cmd("devices", "-l")
-            devs = []
-            if code == 0:
-                for line in out.strip().split("\n")[1:]:
-                    parts = line.split()
-                    if len(parts) < 2:
-                        continue
-                    serial = parts[0]
-                    state = parts[1]
-                    model = "?"
-                    for tok in parts:
-                        if tok.startswith("model:"):
-                            model = tok[6:]
-                    devs.append({"serial": serial, "model": model, "state": state})
+            code, out, _ = run_adb("devices", "-l")
+            devs = parse_devices(out) if code == 0 else []
             self.after(0, lambda: self._update_devices(devs))
 
         threading.Thread(target=_work, daemon=True).start()
@@ -363,7 +286,8 @@ class MediatelApp(tk.Tk):
         dev = self._current_device()
         if not dev or dev["state"] != "device":
             self._clear_tree()
-            self._show_notice("Device not authorized or not connected.")
+            msg = "Device not authorized. Please accept USB debugging on your device." if (dev and dev["state"] == "unauthorized") else "No device selected."
+            self._show_notice(msg)
             return
         self._hide_notice()
         self._set_busy(True)
@@ -371,7 +295,8 @@ class MediatelApp(tk.Tk):
         path = self.current_path if self.current_path.endswith("/") else self.current_path + "/"
 
         def _work():
-            code, out, err = adb_cmd("shell", f"ls -AlL --color=never '{path}' 2>/dev/null", serial=serial)
+            quoted = sh_quote(path)
+            code, out, _ = run_adb("shell", f"ls -AlL --color=never {quoted} 2>/dev/null", serial=serial)
             entries = parse_ls(out) if code == 0 else []
             self.after(0, lambda: self._update_tree(entries))
 
@@ -383,8 +308,7 @@ class MediatelApp(tk.Tk):
         for e in entries:
             icon = "📁" if e["is_dir"] else "📄"
             size = "—" if e["is_dir"] else human_size(e["size"])
-            self.tree.insert("", tk.END, iid=e["name"],
-                             values=(icon, e["name"], size, e["date"]))
+            self.tree.insert("", tk.END, iid=e["name"], values=(icon, e["name"], size, e["date"]))
         self._set_busy(False)
 
     def _clear_tree(self):
@@ -441,7 +365,7 @@ class MediatelApp(tk.Tk):
         self._set_busy(True, indeterminate=True)
 
         def _work():
-            code, out, err = adb_cmd("push", filepath, dest, serial=serial, timeout=600)
+            code, _, err = run_adb("push", filepath, dest, serial=serial, timeout=600)
             ok = code == 0
             self.after(0, lambda: self._on_transfer_done(
                 f"Pushed {basename} to device." if ok else f"Push failed: {err.strip()}"
@@ -470,7 +394,7 @@ class MediatelApp(tk.Tk):
         self._set_busy(True, indeterminate=True)
 
         def _work():
-            code, out, err = adb_cmd("pull", remote, dest_dir, serial=serial, timeout=600)
+            code, _, err = run_adb("pull", remote, dest_dir, serial=serial, timeout=600)
             ok = code == 0
             self.after(0, lambda: self._on_transfer_done(
                 f"Pulled to {dest_dir}." if ok else f"Pull failed: {err.strip()}"
@@ -492,9 +416,10 @@ class MediatelApp(tk.Tk):
             return
         serial = dev["serial"]
         target = self.current_path.rstrip("/") + "/" + name
+        quoted = sh_quote(target)
 
         def _work():
-            code, _, err = adb_cmd("shell", f"mkdir -p '{target}'", serial=serial)
+            code, _, err = run_adb("shell", f"mkdir -p {quoted}", serial=serial)
             self.after(0, lambda: self._on_op_done(
                 "Folder created." if code == 0 else f"Failed: {err.strip()}"
             ))
@@ -510,9 +435,10 @@ class MediatelApp(tk.Tk):
             return
         serial = dev["serial"]
         target = self.current_path.rstrip("/") + "/" + entry["name"]
+        quoted = sh_quote(target)
 
         def _work():
-            code, _, err = adb_cmd("shell", f"rm -rf '{target}'", serial=serial)
+            code, _, err = run_adb("shell", f"rm -rf {quoted}", serial=serial)
             self.after(0, lambda: self._on_op_done(
                 "Deleted." if code == 0 else f"Delete failed: {err.strip()}"
             ))
@@ -530,9 +456,11 @@ class MediatelApp(tk.Tk):
         serial = dev["serial"]
         src = self.current_path.rstrip("/") + "/" + entry["name"]
         dst = self.current_path.rstrip("/") + "/" + new_name
+        quoted_src = sh_quote(src)
+        quoted_dst = sh_quote(dst)
 
         def _work():
-            code, _, err = adb_cmd("shell", f"mv '{src}' '{dst}'", serial=serial)
+            code, _, err = run_adb("shell", f"mv {quoted_src} {quoted_dst}", serial=serial)
             self.after(0, lambda: self._on_op_done(
                 "Renamed." if code == 0 else f"Rename failed: {err.strip()}"
             ))
@@ -578,7 +506,7 @@ class MediatelApp(tk.Tk):
         self._set_busy(True, indeterminate=True)
 
         def _work():
-            code, out, err = adb_cmd("pull", remote, dest_dir, serial=serial, timeout=600)
+            code, _, err = run_adb("pull", remote, dest_dir, serial=serial, timeout=600)
             ok = code == 0
             self.after(0, lambda: self._on_transfer_done(
                 f"Pulled to {dest_dir}." if ok else f"Pull failed: {err.strip()}"
@@ -615,19 +543,23 @@ class FlashDialog(tk.Toplevel):
         super().__init__(parent)
         self.parent = parent
         self.title("⚡ Flash Firmware — RANDROID")
-        self.geometry("640x520")
+        self.geometry("720x640")
+        self.minsize(680, 560)
         self.configure(bg=COLORS["bg"])
-        self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
-        self.has_heimdall = shutil.which("heimdall") is not None
-        self.has_odin = shutil.which("odin4") is not None
+        self.odin_bin = find_tool("odin4") or find_tool("odin")
+        self.heimdall_bin = find_tool("heimdall")
+
+        # Odin files
         self.bl_path = tk.StringVar()
         self.ap_path = tk.StringVar()
         self.cp_path = tk.StringVar()
         self.csc_path = tk.StringVar()
-        self.log_text = ""
+
+        # Heimdall partitions: list of (StringVar name, StringVar path)
+        self.heimdall_rows = []
 
         self._build_ui()
 
@@ -638,140 +570,264 @@ class FlashDialog(tk.Toplevel):
         # Header
         ttk.Label(main, text="⚡ Flash Firmware", font=("Segoe UI", 16, "bold")).pack(anchor=tk.W)
         ttk.Label(main, text="Restore signed firmware only. No FRP/lock bypass.",
-                  style="Dim.TLabel", font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(2, 8))
+                  style="Dim.TLabel", font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(2, 6))
 
-        # Tool badges
-        badge_frame = ttk.Frame(main)
-        badge_frame.pack(fill=tk.X, pady=(0, 8))
-        h_color = "Green.TLabel" if self.has_heimdall else "Dim.TLabel"
-        o_color = "Green.TLabel" if self.has_odin else "Dim.TLabel"
-        ttk.Label(badge_frame, text=f"{'✅' if self.has_heimdall else '❌'} Heimdall",
-                  style=h_color, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Label(badge_frame, text=f"{'✅' if self.has_odin else '❌'} Odin4",
-                  style=o_color, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        # Status & detect tools
+        top_bar = ttk.Frame(main)
+        top_bar.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Separator(main).pack(fill=tk.X, pady=8)
+        h_icon = "✅" if self.heimdall_bin else "❌"
+        o_icon = "✅" if self.odin_bin else "❌"
+        ttk.Label(top_bar, text=f"{h_icon} Heimdall",
+                  style="Green.TLabel" if self.heimdall_bin else "Dim.TLabel",
+                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Label(top_bar, text=f"{o_icon} Odin4",
+                  style="Green.TLabel" if self.odin_bin else "Dim.TLabel",
+                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 20))
 
-        # Action buttons
-        btn_frame = ttk.Frame(main)
-        btn_frame.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(btn_frame, text="⬇ Reboot to Download", command=self._reboot_download).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="🔍 Detect (Download)", command=self._detect).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top_bar, text="⬇ Reboot Download", command=self._reboot_download).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(top_bar, text="🔍 Detect Device", command=self._detect).pack(side=tk.RIGHT, padx=2)
 
-        ttk.Separator(main).pack(fill=tk.X, pady=8)
+        ttk.Separator(main).pack(fill=tk.X, pady=6)
 
-        # Odin4 section
-        if self.has_odin:
-            ttk.Label(main, text="Odin4 — Samsung firmware (.tar.md5)",
-                      font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 4))
-            self._file_row(main, "BL (bootloader)", self.bl_path)
-            self._file_row(main, "AP (system)", self.ap_path)
-            self._file_row(main, "CP (modem)", self.cp_path)
-            self._file_row(main, "CSC (region)", self.csc_path)
-            ttk.Label(main, text="⚠️ Wrong firmware can brick the device — model must match exactly!",
-                      style="Orange.TLabel", font=("Segoe UI", 9)).pack(anchor=tk.W, pady=2)
-            ttk.Button(main, text="⚡ Flash with Odin4", style="Accent.TButton",
-                       command=self._flash_odin).pack(anchor=tk.W, pady=(4, 8))
+        # Notebook tabs for Odin4 and Heimdall
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=4)
 
-        # Heimdall section
-        if self.has_heimdall and not self.has_odin:
-            ttk.Label(main, text="Heimdall — partition images (.img)",
-                      font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 4))
-            ttk.Label(main, text="Use command line for Heimdall partitions:\n"
-                      "mediatel flash heimdall --partition RECOVERY:recovery.img",
-                      style="Dim.TLabel", font=("Consolas", 9)).pack(anchor=tk.W, pady=4)
+        # ── Tab 1: Odin4 ──
+        tab_odin = ttk.Frame(self.notebook)
+        self.notebook.add(tab_odin, text="Odin4 (Samsung .tar.md5)")
+        self._build_odin_tab(tab_odin)
 
-        if not self.has_heimdall and not self.has_odin:
-            ttk.Label(main, text="No flash tools installed.", style="Orange.TLabel",
-                      font=("Segoe UI", 11)).pack(anchor=tk.W, pady=8)
-            ttk.Label(main, text="• Heimdall (open source): choco install heimdall\n"
-                      "• Odin4 (Samsung CLI): add odin4.exe to PATH",
-                      style="Dim.TLabel", font=("Consolas", 9)).pack(anchor=tk.W)
+        # ── Tab 2: Heimdall ──
+        tab_heimdall = ttk.Frame(self.notebook)
+        self.notebook.add(tab_heimdall, text="Heimdall (Partition .img)")
+        self._build_heimdall_tab(tab_heimdall)
 
-        ttk.Separator(main).pack(fill=tk.X, pady=8)
+        ttk.Separator(main).pack(fill=tk.X, pady=6)
 
-        # Log area
-        self.log_widget = tk.Text(main, bg=COLORS["bg_secondary"], fg=COLORS["fg_dim"],
+        # Log output
+        ttk.Label(main, text="Output Log:", style="Dim.TLabel", font=("Segoe UI", 9)).pack(anchor=tk.W)
+        self.log_widget = tk.Text(main, bg=COLORS["bg_secondary"], fg=COLORS["fg"],
                                    font=("Consolas", 9), height=5, borderwidth=0,
                                    insertbackground=COLORS["fg"])
-        self.log_widget.pack(fill=tk.BOTH, expand=True)
-        self.log_widget.insert("1.0", "Ready.")
+        self.log_widget.pack(fill=tk.X, pady=(2, 0))
+        self.log_widget.insert("1.0", "Ready.\n")
         self.log_widget.configure(state=tk.DISABLED)
+
+    def _build_odin_tab(self, parent):
+        f = ttk.Frame(parent)
+        f.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+
+        if not self.odin_bin:
+            ttk.Label(f, text="⚠️ Odin4 binary not found in PATH or app directory.",
+                      style="Orange.TLabel", font=("Segoe UI", 10)).pack(anchor=tk.W, pady=(0, 4))
+            ttk.Label(f, text="Place 'odin4.exe' in PATH or in the same folder as Mediatel.exe",
+                      style="Dim.TLabel", font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(0, 8))
+
+        ttk.Label(f, text="Samsung firmware archives (.tar.md5):",
+                  font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 6))
+
+        self._file_row(f, "BL (bootloader)", self.bl_path)
+        self._file_row(f, "AP (system)", self.ap_path)
+        self._file_row(f, "CP (modem)", self.cp_path)
+        self._file_row(f, "CSC (region)", self.csc_path)
+
+        ttk.Label(f, text="⚠️ A wrong firmware can brick the device — model must match exactly!",
+                  style="Orange.TLabel", font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(6, 8))
+
+        btn_row = ttk.Frame(f)
+        btn_row.pack(fill=tk.X, pady=4)
+        ttk.Button(btn_row, text="⚡ Flash with Odin4", style="Accent.TButton",
+                   command=self._flash_odin).pack(side=tk.LEFT)
+
+    def _build_heimdall_tab(self, parent):
+        f = ttk.Frame(parent)
+        f.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+
+        if not self.heimdall_bin:
+            ttk.Label(f, text="⚠️ Heimdall binary not found in PATH or app directory.",
+                      style="Orange.TLabel", font=("Segoe UI", 10)).pack(anchor=tk.W, pady=(0, 4))
+            ttk.Label(f, text="Install Heimdall (e.g., choco install heimdall) or place heimdall.exe in PATH.",
+                      style="Dim.TLabel", font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(0, 8))
+
+        ttk.Label(f, text="Partition images (.img):",
+                  font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 6))
+
+        # Container for partition rows
+        self.parts_container = ttk.Frame(f)
+        self.parts_container.pack(fill=tk.BOTH, expand=True)
+
+        # Add initial rows
+        self._add_heimdall_row("RECOVERY")
+        self._add_heimdall_row("BOOT")
+
+        btn_row = ttk.Frame(f)
+        btn_row.pack(fill=tk.X, pady=8)
+        ttk.Button(btn_row, text="➕ Add Partition", command=lambda: self._add_heimdall_row()).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="⚡ Flash with Heimdall", style="Accent.TButton",
+                   command=self._flash_heimdall).pack(side=tk.LEFT)
+
+    def _add_heimdall_row(self, default_name=""):
+        row_frame = ttk.Frame(self.parts_container)
+        row_frame.pack(fill=tk.X, pady=2)
+
+        name_var = tk.StringVar(value=default_name)
+        file_var = tk.StringVar()
+
+        e_name = ttk.Entry(row_frame, textvariable=name_var, width=16, font=("Consolas", 9))
+        e_name.pack(side=tk.LEFT, padx=(0, 6))
+
+        lbl_file = ttk.Label(row_frame, textvariable=file_var, style="Dim.TLabel",
+                             font=("Segoe UI", 9), width=28)
+        lbl_file.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        def _browse():
+            f = filedialog.askopenfilename(
+                title=f"Select partition image for {name_var.get() or 'partition'}",
+                filetypes=[("Partition images", "*.img *.bin *.lz4"), ("All files", "*.*")]
+            )
+            if f:
+                file_var.set(os.path.basename(f))
+                file_var._full_path = f
+
+        def _remove():
+            if (name_var, file_var) in self.heimdall_rows:
+                self.heimdall_rows.remove((name_var, file_var))
+            row_frame.destroy()
+
+        ttk.Button(row_frame, text="Browse", command=_browse).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row_frame, text="✕", width=2, command=_remove).pack(side=tk.LEFT, padx=2)
+
+        self.heimdall_rows.append((name_var, file_var))
 
     def _file_row(self, parent, label, var):
         row = ttk.Frame(parent)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text=label, font=("Consolas", 10), width=16).pack(side=tk.LEFT)
-        ttk.Label(row, textvariable=var, style="Dim.TLabel", font=("Segoe UI", 9),
-                  width=30).pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
-        ttk.Button(row, text="Browse", command=lambda: self._choose_file(var)).pack(side=tk.RIGHT)
+        row.pack(fill=tk.X, pady=3)
+        ttk.Label(row, text=label, font=("Consolas", 10), width=18).pack(side=tk.LEFT)
+        lbl = ttk.Label(row, textvariable=var, style="Dim.TLabel", font=("Segoe UI", 9), width=32)
+        lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
 
-    def _choose_file(self, var):
-        f = filedialog.askopenfilename(
-            title="Select firmware file",
-            filetypes=[("Firmware", "*.tar.md5 *.tar *.img *.bin *.lz4"), ("All files", "*.*")]
-        )
-        if f:
-            var.set(os.path.basename(f))
-            var._full_path = f
+        def _choose():
+            f = filedialog.askopenfilename(
+                title=f"Select {label}",
+                filetypes=[("Firmware archive", "*.tar.md5 *.tar *.img *.bin *.lz4"), ("All files", "*.*")]
+            )
+            if f:
+                var.set(os.path.basename(f))
+                var._full_path = f
+
+        def _clear():
+            var.set("")
+            var._full_path = ""
+
+        ttk.Button(row, text="Browse", command=_choose).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text="✕", width=2, command=_clear).pack(side=tk.LEFT, padx=2)
 
     def _log(self, msg):
         self.log_widget.configure(state=tk.NORMAL)
-        self.log_widget.delete("1.0", tk.END)
-        self.log_widget.insert("1.0", msg)
+        self.log_widget.insert(tk.END, msg.strip() + "\n")
+        self.log_widget.see(tk.END)
         self.log_widget.configure(state=tk.DISABLED)
 
     def _reboot_download(self):
         dev = self.parent._current_device()
         if not dev:
-            self._log("No device connected.")
+            self._log("❌ No device connected.")
             return
-        self._log("Sending reboot download...")
+        self._log(f"🔄 Rebooting {dev['serial']} into Download mode...")
 
         def _work():
-            code, out, err = adb_cmd("reboot", "download", serial=dev["serial"])
-            msg = "Reboot command sent." if code == 0 else f"Failed: {err.strip()}"
+            code, _, err = run_adb("reboot", "download", serial=dev["serial"])
+            msg = "✅ Reboot command sent." if code == 0 else f"❌ Failed: {err.strip()}"
             self.after(0, lambda: self._log(msg))
 
         threading.Thread(target=_work, daemon=True).start()
 
     def _detect(self):
-        self._log("Detecting...")
+        self._log("🔍 Detecting device in Download mode...")
 
         def _work():
             msgs = []
-            if self.has_heimdall:
-                code, out, err = run_cmd(["heimdall", "detect"])
+            if self.heimdall_bin:
+                code, _, _ = run_command([self.heimdall_bin, "detect"])
                 msgs.append(f"Heimdall: {'✅ Device detected' if code == 0 else '❌ No device'}")
-            if self.has_odin:
-                code, out, err = run_cmd(["odin4", "-l"])
+            if self.odin_bin:
+                code, out, _ = run_command([self.odin_bin, "-l"])
                 detected = code == 0 and out.strip()
                 msgs.append(f"Odin4: {'✅ Device detected' if detected else '❌ No device'}")
             if not msgs:
-                msgs.append("No flash tools installed.")
+                msgs.append("❌ Neither Heimdall nor Odin4 installed.")
             self.after(0, lambda: self._log("\n".join(msgs)))
 
         threading.Thread(target=_work, daemon=True).start()
 
     def _flash_odin(self):
-        args = ["odin4"]
+        if not self.odin_bin:
+            self._log("❌ Odin4 binary not found.")
+            return
+        args = [self.odin_bin]
         paths = {"-b": self.bl_path, "-a": self.ap_path, "-c": self.cp_path, "-s": self.csc_path}
         for flag, var in paths.items():
-            full = getattr(var, "_full_path", None)
-            if full:
+            full = getattr(var, "_full_path", "")
+            if full and os.path.exists(full):
                 args += [flag, full]
+
         if len(args) == 1:
-            self._log("No firmware files selected.")
+            self._log("❌ No firmware files selected. Browse for at least one archive.")
             return
-        if not messagebox.askyesno("Flash", "Flash firmware with Odin4?\n\nWrong firmware can brick the device!",
-                                    icon="warning", parent=self):
+
+        if not messagebox.askyesno(
+            "Flash Firmware",
+            "Flash firmware with Odin4?\n\n⚠️ An incorrect firmware can brick the device!\nProceed?",
+            icon="warning",
+            parent=self,
+        ):
             return
-        self._log("Flashing with Odin4...")
+
+        self._log("⚡ Starting Odin4 flash...")
 
         def _work():
-            code, out, err = run_cmd(args, timeout=1200)
-            result = ("✅ Flash complete.\n" if code == 0 else f"❌ Failed (code {code}).\n") + out + err
-            self.after(0, lambda: self._log(result))
+            code, out, err = run_command(args, timeout=1200)
+            res = ("✅ Flash completed successfully.\n" if code == 0 else f"❌ Flash failed (code {code}).\n") + out + err
+            self.after(0, lambda: self._log(res))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _flash_heimdall(self):
+        if not self.heimdall_bin:
+            self._log("❌ Heimdall binary not found.")
+            return
+
+        valid_parts = []
+        for name_var, file_var in self.heimdall_rows:
+            p_name = name_var.get().strip().upper()
+            p_file = getattr(file_var, "_full_path", "") or file_var.get().strip()
+            if p_name and p_file and os.path.exists(p_file):
+                valid_parts.append((p_name, p_file))
+
+        if not valid_parts:
+            self._log("❌ No valid partition images selected.")
+            return
+
+        if not messagebox.askyesno(
+            "Flash Firmware",
+            f"Flash {len(valid_parts)} partition(s) with Heimdall?\n\nProceed?",
+            icon="warning",
+            parent=self,
+        ):
+            return
+
+        args = [self.heimdall_bin, "flash", "--no-reboot"]
+        for p_name, p_file in valid_parts:
+            args += [f"--{p_name}", p_file]
+
+        self._log(f"⚡ Flashing {len(valid_parts)} partition(s) with Heimdall...")
+
+        def _work():
+            code, out, err = run_command(args, timeout=1200)
+            res = ("✅ Heimdall flash completed.\n" if code == 0 else f"❌ Heimdall flash failed (code {code}).\n") + out + err
+            self.after(0, lambda: self._log(res))
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -780,7 +836,6 @@ class FlashDialog(tk.Toplevel):
 
 def main():
     app = MediatelApp()
-    # Set window icon if available
     try:
         icon_path = Path(__file__).parent / "icon.ico"
         if icon_path.exists():

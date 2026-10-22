@@ -1,9 +1,9 @@
 # ═══════════════════════════════════════════════════════════════
 #  RANDROID — Mediatel Windows Build (GitHub Actions)
-#  Automatically builds Windows .exe files on push/tag
+#  Runs tests, builds Windows .exe files, smoke-tests binaries
 # ═══════════════════════════════════════════════════════════════
 
-name: Build Windows Executables
+name: Build and Test Windows Executables
 
 on:
   push:
@@ -14,8 +14,8 @@ on:
   workflow_dispatch:  # Manual trigger
 
 jobs:
-  build-windows:
-    name: Build Windows EXEs
+  test-and-build:
+    name: Test & Build Windows EXEs
     runs-on: windows-latest
 
     steps:
@@ -27,32 +27,41 @@ jobs:
       with:
         python-version: '3.11'
 
+    - name: Run Automated Unit Tests
+      run: |
+        python -m unittest discover -s Sources/Mediatel/windows-build/tests -p "test_*.py" -v
+
     - name: Install PyInstaller
       run: pip install pyinstaller
 
     - name: Build Mediatel GUI
       run: |
         cd Sources/Mediatel/windows-build/mediatel-gui
-        pyinstaller --onefile --windowed --name "Mediatel" `
-          --exclude-module matplotlib --exclude-module numpy `
-          --exclude-module pandas --exclude-module scipy `
-          --exclude-module PIL --exclude-module cv2 `
-          mediatel_gui.py
+        pyinstaller --clean --noconfirm mediatel_gui.spec
 
     - name: Build Mediatel CLI
       run: |
         cd Sources/Mediatel/windows-build/mediatel-cli
-        pyinstaller --onefile --console --name "mediatel-cli" `
-          --exclude-module tkinter --exclude-module matplotlib `
-          --exclude-module numpy --exclude-module pandas `
-          --exclude-module scipy --exclude-module PIL `
-          mediatel_cli.py
+        pyinstaller --clean --noconfirm mediatel_cli.spec
 
     - name: Collect artifacts
       run: |
         mkdir -p artifacts
         cp Sources/Mediatel/windows-build/mediatel-gui/dist/Mediatel.exe artifacts/
         cp Sources/Mediatel/windows-build/mediatel-cli/dist/mediatel-cli.exe artifacts/
+      shell: bash
+
+    - name: Smoke Test CLI Executable
+      run: |
+        ./artifacts/mediatel-cli.exe --version
+        ./artifacts/mediatel-cli.exe --help
+        ./artifacts/mediatel-cli.exe devices
+      shell: bash
+
+    - name: Smoke Test GUI Executable Existence & Size
+      run: |
+        ls -la artifacts/Mediatel.exe
+        test -s artifacts/Mediatel.exe
       shell: bash
 
     - name: Upload Mediatel GUI
@@ -67,16 +76,16 @@ jobs:
         name: Mediatel-CLI-Windows
         path: artifacts/mediatel-cli.exe
 
-    - name: Upload All
+    - name: Upload Complete Bundle
       uses: actions/upload-artifact@v4
       with:
         name: Mediatel-Windows-Bundle
         path: artifacts/
 
-  # Auto-create GitHub Release on version tags
+  # Auto-create or update GitHub Release on version tags
   release:
     name: Create Release
-    needs: build-windows
+    needs: test-and-build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -96,18 +105,17 @@ jobs:
         body: |
           ## RANDROID — Mediatel ${{ github.ref_name }}
 
-          ### Downloads
-          - **Mediatel.exe** — GUI desktop app for Android device management
-          - **mediatel-cli.exe** — Command-line interface
+          ### Verified & Tested Release
+          All automated tests passed successfully on Windows before packaging.
 
-          ### Requirements
+          ### Downloads:
+          - **[Mediatel.exe](https://github.com/randytech509/mediatel-app/releases/download/${{ github.ref_name }}/Mediatel.exe)** — Desktop GUI App (Dark Theme, File Manager, Flash Tool)
+          - **[mediatel-cli.exe](https://github.com/randytech509/mediatel-app/releases/download/${{ github.ref_name }}/mediatel-cli.exe)** — Command-Line Interface (12 commands + interactive shell)
+
+          ### Requirements:
           - Windows 10/11 (64-bit)
-          - ADB (Android Debug Bridge) in PATH or Android SDK installed
+          - ADB in PATH or standard Android SDK
           - USB debugging enabled on your Android device
-
-          ### Usage
-          **GUI:** Double-click `Mediatel.exe`
-          **CLI:** Open Command Prompt and run `mediatel-cli.exe --help`
 
           ---
           *RandyTech Solutions © 2024-2026*

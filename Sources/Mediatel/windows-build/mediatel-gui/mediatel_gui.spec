@@ -5,10 +5,10 @@ PyInstaller spec for Mediatel GUI — single-file Windows .exe
 
 a = Analysis(
     ['mediatel_gui.py'],
-    pathex=[],
+    pathex=['..'],
     binaries=[],
     datas=[],
-    hiddenimports=['tkinter', 'tkinter.ttk', 'tkinter.filedialog',
+    hiddenimports=['mediatel_core', 'tkinter', 'tkinter.ttk', 'tkinter.filedialog',
                    'tkinter.messagebox', 'tkinter.simpledialog'],
     hookspath=[],
     hooksconfig={},

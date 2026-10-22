@@ -32,3 +32,4 @@ windows-build/dist/
 # OS
 Thumbs.db
 ehthumbs.db
+release-binaries/

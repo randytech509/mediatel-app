@@ -5,10 +5,10 @@ PyInstaller spec for Mediatel CLI — single-file Windows .exe
 
 a = Analysis(
     ['mediatel_cli.py'],
-    pathex=[],
+    pathex=['..'],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['mediatel_core'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

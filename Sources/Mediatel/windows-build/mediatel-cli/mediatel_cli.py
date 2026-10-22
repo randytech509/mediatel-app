@@ -4,7 +4,7 @@ RANDROID — Mediatel CLI
 -----------------------
 Windows command-line interface for Android device management via ADB.
 Features: device listing, file browsing, push/pull, rename, delete, mkdir,
-          firmware flash (Heimdall, Odin4).
+          firmware flash (Heimdall, Odin4), and interactive shell.
 
 RandyTech Solutions © 2024-2026
 """
@@ -12,83 +12,35 @@ RandyTech Solutions © 2024-2026
 import argparse
 import os
 import shutil
-import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
+# Add parent directory to sys.path to load mediatel_core
+_parent = str(Path(__file__).resolve().parent.parent)
+if _parent not in sys.path:
+    sys.path.insert(0, _parent)
 
-# ─── Shell helpers ────────────────────────────────────────────────────────────
-
-def find_adb() -> str:
-    """Locate adb.exe on Windows, checking common SDK locations."""
-    adb = shutil.which("adb")
-    if adb:
-        return adb
-    # Common Windows Android SDK paths
-    candidates = [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Android" / "Sdk" / "platform-tools" / "adb.exe",
-        Path(os.environ.get("USERPROFILE", "")) / "AppData" / "Local" / "Android" / "Sdk" / "platform-tools" / "adb.exe",
-        Path("C:/Android/Sdk/platform-tools/adb.exe"),
-        Path("C:/Program Files/Android/platform-tools/adb.exe"),
-        Path("C:/platform-tools/adb.exe"),
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return "adb"  # fallback – let OS try to find it
-
-
-ADB = find_adb()
-
-
-def run(args: list[str], timeout: int = 60) -> tuple[int, str, str]:
-    """Run a command and return (code, stdout, stderr)."""
-    try:
-        p = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        return p.returncode, p.stdout, p.stderr
-    except FileNotFoundError:
-        return 127, "", f"Not found: {args[0]}"
-    except subprocess.TimeoutExpired:
-        return 1, "", "Command timed out"
-
-
-def adb(*args, serial: str | None = None, timeout: int = 120) -> tuple[int, str, str]:
-    """Run an ADB command, optionally targeting a specific device."""
-    cmd = [ADB]
-    if serial:
-        cmd += ["-s", serial]
-    cmd += list(args)
-    return run(cmd, timeout=timeout)
+from mediatel_core import (
+    find_adb,
+    find_tool,
+    human_size,
+    parse_devices,
+    parse_ls,
+    run_adb,
+    run_command,
+    sh_quote,
+)
 
 
 # ─── Device management ───────────────────────────────────────────────────────
 
 def list_devices() -> list[dict]:
     """Return list of connected ADB devices."""
-    code, out, _ = adb("devices", "-l")
+    code, out, _ = run_adb("devices", "-l")
     if code != 0:
         return []
-    devices = []
-    for line in out.strip().split("\n")[1:]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        serial = parts[0]
-        state = parts[1]
-        model = "?"
-        for tok in parts:
-            if tok.startswith("model:"):
-                model = tok[6:]
-        devices.append({"serial": serial, "model": model, "state": state})
-    return devices
+    return parse_devices(out)
 
 
 def pick_device(devices: list[dict], serial: str | None = None) -> dict | None:
@@ -100,7 +52,7 @@ def pick_device(devices: list[dict], serial: str | None = None) -> dict | None:
         for d in devices:
             if d["serial"] == serial:
                 return d
-        print(f"❌ Device {serial} not found.")
+        print(f"❌ Device '{serial}' not found.")
         return None
     if len(devices) == 1:
         return devices[0]
@@ -117,76 +69,40 @@ def pick_device(devices: list[dict], serial: str | None = None) -> dict | None:
         print("Invalid selection.")
 
 
-# ─── File browser helpers ────────────────────────────────────────────────────
-
-def parse_ls(output: str) -> list[dict]:
-    """Parse `ls -AlL` output into file entries."""
-    entries = []
-    for raw in output.split("\n"):
-        line = raw.strip()
-        if not line or line.startswith("total "):
-            continue
-        parts = line.split(None, 7)
-        if len(parts) < 8:
-            continue
-        perm, _, _, _, size_str, date_part, time_part, name = parts
-        is_dir = perm.startswith("d")
-        is_link = perm.startswith("l")
-        if is_link and " -> " in name:
-            name = name.split(" -> ")[0]
-        size = 0 if (is_dir or is_link) else int(size_str or "0")
-        entries.append({
-            "name": name,
-            "is_dir": is_dir or is_link,
-            "size": size,
-            "date": f"{date_part} {time_part}",
-        })
-    entries.sort(key=lambda e: (0 if e["is_dir"] else 1, e["name"].lower()))
-    return entries
-
-
-def human_size(n: int) -> str:
-    """Human readable file size."""
-    v = float(n)
-    for u in ["B", "KB", "MB", "GB", "TB"]:
-        if v < 1024:
-            return f"{int(v)}{u}" if u == "B" else f"{v:.1f}{u}"
-        v /= 1024
-    return f"{v:.1f}PB"
-
-
 # ─── Commands ────────────────────────────────────────────────────────────────
 
-def cmd_devices(args):
+def cmd_devices(args) -> int:
     """List connected devices."""
     devices = list_devices()
     if not devices:
         print("No devices detected.")
-        return
+        return 0
     print(f"\n{'Serial':<25} {'Model':<20} {'State':<15}")
     print("─" * 60)
     for d in devices:
         print(f"{d['serial']:<25} {d['model']:<20} {d['state']:<15}")
     print(f"\n{len(devices)} device(s) connected.")
+    return 0
 
 
-def cmd_ls(args):
+def cmd_ls(args) -> int:
     """List files on device."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
+        return 1
     path = args.path or "/sdcard"
     if not path.endswith("/"):
         path += "/"
-    code, out, err = adb("shell", f"ls -AlL --color=never '{path}' 2>/dev/null", serial=dev["serial"])
+    quoted_path = sh_quote(path)
+    code, out, err = run_adb("shell", f"ls -AlL --color=never {quoted_path} 2>/dev/null", serial=dev["serial"])
     if code != 0:
         print(f"❌ Failed to list {path}: {err.strip()}")
-        return
+        return code
     entries = parse_ls(out)
     if not entries:
         print(f"📂 {path} is empty.")
-        return
+        return 0
     print(f"\n📂 {path}")
     print(f"{'Type':<6} {'Size':>10}  {'Date':<16}  {'Name'}")
     print("─" * 70)
@@ -195,148 +111,166 @@ def cmd_ls(args):
         s = "—" if e["is_dir"] else human_size(e["size"])
         print(f" {t}    {s:>10}  {e['date']:<16}  {e['name']}")
     print(f"\n{len(entries)} item(s).")
+    return 0
 
 
-def cmd_push(args):
+def cmd_push(args) -> int:
     """Push file from PC to device."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
+        return 1
     local = args.local
     dest = args.dest or "/sdcard/"
     if not os.path.exists(local):
         print(f"❌ Local file not found: {local}")
-        return
+        return 1
     basename = os.path.basename(local)
     size = os.path.getsize(local) if os.path.isfile(local) else 0
-    print(f"⬆️  Pushing {basename} ({human_size(size) if size else 'directory'}) to {dest}...")
-    code, out, err = adb("push", local, dest, serial=dev["serial"], timeout=600)
+    size_label = human_size(size) if size else "directory"
+    print(f"⬆️  Pushing {basename} ({size_label}) to {dest}...")
+    code, out, err = run_adb("push", local, dest, serial=dev["serial"], timeout=600)
     if code == 0:
-        print(f"✅ Successfully pushed to device.")
+        print("✅ Successfully pushed to device.")
+        return 0
     else:
         print(f"❌ Push failed: {err.strip()}")
+        return code
 
 
-def cmd_pull(args):
+def cmd_pull(args) -> int:
     """Pull file from device to PC."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
+        return 1
     remote = args.remote
     local_dir = args.dest or "."
     basename = remote.rstrip("/").split("/")[-1]
     print(f"⬇️  Pulling {basename} to {local_dir}...")
-    code, out, err = adb("pull", remote, local_dir, serial=dev["serial"], timeout=600)
+    code, out, err = run_adb("pull", remote, local_dir, serial=dev["serial"], timeout=600)
     if code == 0:
         print(f"✅ Successfully pulled to {local_dir}.")
+        return 0
     else:
         print(f"❌ Pull failed: {err.strip()}")
+        return code
 
 
-def cmd_delete(args):
+def cmd_delete(args) -> int:
     """Delete file/folder on device."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
+        return 1
     target = args.path
     if not args.yes:
         confirm = input(f"⚠️  Delete '{target}' on device? This is irreversible. (y/N): ")
         if confirm.lower() != "y":
             print("Cancelled.")
-            return
-    code, out, err = adb("shell", f"rm -rf '{target}'", serial=dev["serial"])
+            return 0
+    quoted = sh_quote(target)
+    code, out, err = run_adb("shell", f"rm -rf {quoted}", serial=dev["serial"])
     if code == 0:
-        print(f"✅ Deleted.")
+        print("✅ Deleted.")
+        return 0
     else:
         print(f"❌ Failed to delete: {err.strip()}")
+        return code
 
 
-def cmd_rename(args):
+def cmd_rename(args) -> int:
     """Rename file/folder on device."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
+        return 1
     src = args.path
-    dst_dir = "/".join(src.rstrip("/").split("/")[:-1])
-    dst = f"{dst_dir}/{args.new_name}"
-    code, out, err = adb("shell", f"mv '{src}' '{dst}'", serial=dev["serial"])
+    parts = src.rstrip("/").split("/")
+    dst_dir = "/".join(parts[:-1]) if len(parts) > 1 else ""
+    dst = f"{dst_dir}/{args.new_name}" if dst_dir else args.new_name
+    quoted_src = sh_quote(src)
+    quoted_dst = sh_quote(dst)
+    code, out, err = run_adb("shell", f"mv {quoted_src} {quoted_dst}", serial=dev["serial"])
     if code == 0:
         print(f"✅ Renamed to {args.new_name}.")
+        return 0
     else:
         print(f"❌ Failed to rename: {err.strip()}")
+        return code
 
 
-def cmd_mkdir(args):
+def cmd_mkdir(args) -> int:
     """Create directory on device."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
-    code, out, err = adb("shell", f"mkdir -p '{args.path}'", serial=dev["serial"])
+        return 1
+    quoted = sh_quote(args.path)
+    code, out, err = run_adb("shell", f"mkdir -p {quoted}", serial=dev["serial"])
     if code == 0:
         print(f"✅ Directory created: {args.path}")
+        return 0
     else:
         print(f"❌ Failed to create directory: {err.strip()}")
+        return code
 
 
-def cmd_shell(args):
+def cmd_shell(args) -> int:
     """Run a shell command on device."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
+        return 1
     command = " ".join(args.command)
-    code, out, err = adb("shell", command, serial=dev["serial"])
+    code, out, err = run_adb("shell", command, serial=dev["serial"])
     if out:
         print(out, end="")
     if err:
         print(err, end="", file=sys.stderr)
-    sys.exit(code)
+    return code
 
 
-def cmd_reboot(args):
+def cmd_reboot(args) -> int:
     """Reboot device."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
+        return 1
     mode = args.mode or ""
     target = f" to {mode}" if mode else ""
     print(f"🔄 Rebooting device{target}...")
     adb_args = ["reboot"]
     if mode:
         adb_args.append(mode)
-    code, out, err = adb(*adb_args, serial=dev["serial"])
+    code, out, err = run_adb(*adb_args, serial=dev["serial"])
     if code == 0:
         print("✅ Reboot command sent.")
+        return 0
     else:
         print(f"❌ Reboot failed: {err.strip()}")
+        return code
 
 
-def cmd_flash(args):
+def cmd_flash(args) -> int:
     """Flash firmware using Heimdall or Odin4."""
-    devices = list_devices()
-
     tool = args.tool.lower()
     if tool == "odin4":
-        flash_odin(args)
+        return flash_odin(args)
     elif tool == "heimdall":
-        flash_heimdall(args)
+        return flash_heimdall(args)
     else:
         print(f"❌ Unknown flash tool: {tool}. Use 'odin4' or 'heimdall'.")
+        return 1
 
 
-def flash_odin(args):
+def flash_odin(args) -> int:
     """Flash Samsung firmware with Odin4."""
-    odin = shutil.which("odin4")
+    odin = find_tool("odin4") or find_tool("odin")
     if not odin:
-        print("❌ odin4 not found in PATH. Install it first.")
-        return
-    cmd = ["odin4"]
+        print("❌ odin4 binary not found. Place odin4.exe in PATH or application directory.")
+        return 1
+    cmd = [odin]
     if args.bl:
         cmd += ["-b", args.bl]
     if args.ap:
@@ -347,42 +281,44 @@ def flash_odin(args):
         cmd += ["-s", args.csc]
     if all(not x for x in [args.bl, args.ap, args.cp, args.csc]):
         print("❌ No firmware files specified. Use --bl, --ap, --cp, --csc.")
-        return
+        return 1
     print("⚡ Flashing with Odin4...")
     print("⚠️  A wrong firmware can brick the device — make sure the model matches exactly!")
     if not args.yes:
         confirm = input("Proceed? (y/N): ")
         if confirm.lower() != "y":
             print("Cancelled.")
-            return
-    code, out, err = run(cmd, timeout=1200)
+            return 0
+    code, out, err = run_command(cmd, timeout=1200)
     print(out)
     if err:
         print(err, file=sys.stderr)
     if code == 0:
         print("✅ Flash complete.")
+        return 0
     else:
         print(f"❌ Flash failed (exit code {code}).")
+        return code
 
 
-def flash_heimdall(args):
+def flash_heimdall(args) -> int:
     """Flash partitions with Heimdall."""
-    heimdall = shutil.which("heimdall")
+    heimdall = find_tool("heimdall")
     if not heimdall:
-        print("❌ heimdall not found in PATH. Install it first.")
-        return
+        print("❌ heimdall binary not found. Place heimdall.exe in PATH or application directory.")
+        return 1
     if not args.partitions:
         print("❌ No partitions specified. Use --partition PART:file.img format.")
-        return
-    cmd = ["heimdall", "flash", "--no-reboot"]
+        return 1
+    cmd = [heimdall, "flash", "--no-reboot"]
     for p in args.partitions:
         if ":" not in p:
-            print(f"❌ Invalid partition format: {p}. Use PARTITION:file.img")
-            return
+            print(f"❌ Invalid partition format: '{p}'. Use PARTITION:file.img")
+            return 1
         name, filepath = p.split(":", 1)
         if not os.path.exists(filepath):
             print(f"❌ File not found: {filepath}")
-            return
+            return 1
         cmd += [f"--{name.upper()}", filepath]
 
     print("⚡ Flashing with Heimdall...")
@@ -390,51 +326,56 @@ def flash_heimdall(args):
         confirm = input("Proceed? (y/N): ")
         if confirm.lower() != "y":
             print("Cancelled.")
-            return
-    code, out, err = run(cmd, timeout=1200)
+            return 0
+    code, out, err = run_command(cmd, timeout=1200)
     print(out)
     if err:
         print(err, file=sys.stderr)
     if code == 0:
         print("✅ Flash complete.")
+        return 0
     else:
         print(f"❌ Flash failed (exit code {code}).")
+        return code
 
 
-def cmd_detect(args):
+def cmd_detect(args) -> int:
     """Detect device in Download mode."""
-    heimdall = shutil.which("heimdall")
-    odin = shutil.which("odin4")
+    heimdall = find_tool("heimdall")
+    odin = find_tool("odin4") or find_tool("odin")
     found = False
     if heimdall:
-        code, out, err = run(["heimdall", "detect"])
+        code, out, err = run_command([heimdall, "detect"])
         if code == 0:
-            print("✅ Heimdall detected device in Download mode.")
+            print("✅ Heimdall: device detected in Download mode.")
             found = True
         else:
             print("ℹ️  Heimdall: no device in Download mode.")
     if odin:
-        code, out, err = run(["odin4", "-l"])
+        code, out, err = run_command([odin, "-l"])
         if code == 0 and out.strip():
-            print("✅ Odin4 detected device in Download mode.")
+            print("✅ Odin4: device detected in Download mode.")
             found = True
         else:
             print("ℹ️  Odin4: no device in Download mode.")
     if not heimdall and not odin:
         print("❌ Neither heimdall nor odin4 found in PATH.")
+        return 1
     elif not found:
         print("❌ No device detected in Download mode.")
+        return 1
+    return 0
 
 
-def cmd_interactive(args):
+def cmd_interactive(args) -> int:
     """Start an interactive file browser session."""
     devices = list_devices()
     dev = pick_device(devices, args.serial)
     if not dev:
-        return
+        return 1
     if dev["state"] != "device":
-        print(f"❌ Device is {dev['state']}. Need 'device' state for file browsing.")
-        return
+        print(f"❌ Device state is '{dev['state']}'. Requires 'device' state for file browsing.")
+        return 1
     serial = dev["serial"]
     path = "/sdcard"
 
@@ -474,7 +415,8 @@ def cmd_interactive(args):
             """))
         elif c == "ls":
             p = path if path.endswith("/") else path + "/"
-            code, out, err = adb("shell", f"ls -AlL --color=never '{p}' 2>/dev/null", serial=serial)
+            quoted = sh_quote(p)
+            code, out, err = run_adb("shell", f"ls -AlL --color=never {quoted} 2>/dev/null", serial=serial)
             entries = parse_ls(out) if code == 0 else []
             if not entries:
                 print("  (empty)")
@@ -492,8 +434,8 @@ def cmd_interactive(args):
                     path = trimmed[:idx] if idx > 0 else "/"
             else:
                 new_path = arg if arg.startswith("/") else f"{path.rstrip('/')}/{arg}"
-                # Check if directory exists
-                code, _, _ = adb("shell", f"test -d '{new_path}' && echo ok", serial=serial)
+                quoted = sh_quote(new_path)
+                code, _, _ = run_adb("shell", f"test -d {quoted} && echo ok", serial=serial)
                 if code == 0:
                     path = new_path
                 else:
@@ -506,7 +448,7 @@ def cmd_interactive(args):
             else:
                 dest = path if path.endswith("/") else path + "/"
                 print(f"  Pushing {os.path.basename(arg)}...")
-                code, out, err = adb("push", arg, dest, serial=serial, timeout=600)
+                code, out, err = run_adb("push", arg, dest, serial=serial, timeout=600)
                 print(f"  {'✅ Done.' if code == 0 else '❌ Failed: ' + err.strip()}")
         elif c == "pull":
             if not arg:
@@ -514,14 +456,15 @@ def cmd_interactive(args):
             else:
                 remote = f"{path.rstrip('/')}/{arg}"
                 print(f"  Pulling {arg}...")
-                code, out, err = adb("pull", remote, ".", serial=serial, timeout=600)
+                code, out, err = run_adb("pull", remote, ".", serial=serial, timeout=600)
                 print(f"  {'✅ Done.' if code == 0 else '❌ Failed: ' + err.strip()}")
         elif c == "mkdir":
             if not arg:
                 print("  Usage: mkdir <dirname>")
             else:
                 target = f"{path.rstrip('/')}/{arg}"
-                code, _, err = adb("shell", f"mkdir -p '{target}'", serial=serial)
+                quoted = sh_quote(target)
+                code, _, err = run_adb("shell", f"mkdir -p {quoted}", serial=serial)
                 print(f"  {'✅ Created.' if code == 0 else '❌ Failed: ' + err.strip()}")
         elif c == "rm":
             if not arg:
@@ -530,7 +473,8 @@ def cmd_interactive(args):
                 target = f"{path.rstrip('/')}/{arg}"
                 confirm = input(f"  ⚠️  Delete '{arg}'? (y/N): ")
                 if confirm.lower() == "y":
-                    code, _, err = adb("shell", f"rm -rf '{target}'", serial=serial)
+                    quoted = sh_quote(target)
+                    code, _, err = run_adb("shell", f"rm -rf {quoted}", serial=serial)
                     print(f"  {'✅ Deleted.' if code == 0 else '❌ Failed: ' + err.strip()}")
                 else:
                     print("  Cancelled.")
@@ -541,7 +485,9 @@ def cmd_interactive(args):
             else:
                 src = f"{path.rstrip('/')}/{rp[0]}"
                 dst = f"{path.rstrip('/')}/{rp[1]}"
-                code, _, err = adb("shell", f"mv '{src}' '{dst}'", serial=serial)
+                quoted_src = sh_quote(src)
+                quoted_dst = sh_quote(dst)
+                code, _, err = run_adb("shell", f"mv {quoted_src} {quoted_dst}", serial=serial)
                 print(f"  {'✅ Renamed.' if code == 0 else '❌ Failed: ' + err.strip()}")
         elif c == "pwd":
             print(f"  {path}")
@@ -552,16 +498,17 @@ def cmd_interactive(args):
             if not arg:
                 print("  Usage: shell <command>")
             else:
-                code, out, err = adb("shell", arg, serial=serial)
+                code, out, err = run_adb("shell", arg, serial=serial)
                 if out:
                     print(out, end="")
                 if err:
                     print(err, end="")
         else:
             print(f"  Unknown command: {c}. Type 'help' for commands.")
+    return 0
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+# ─── Argument Parser ─────────────────────────────────────────────────────────
 
 BANNER = r"""
   ╔══════════════════════════════════════════════════╗
@@ -576,7 +523,8 @@ BANNER = r"""
 """
 
 
-def main():
+def get_parser() -> argparse.ArgumentParser:
+    """Build and return argument parser."""
     parser = argparse.ArgumentParser(
         prog="mediatel",
         description="RANDROID — Mediatel CLI: Android device management via ADB",
@@ -642,14 +590,19 @@ def main():
     sub.add_parser("detect", help="Detect device in Download mode")
 
     # interactive
-    p_int = sub.add_parser("interactive", aliases=["i"], help="Interactive file browser")
+    sub.add_parser("interactive", aliases=["i"], help="Interactive file browser")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = get_parser()
+    args = parser.parse_args(argv)
 
     if args.command is None:
         print(BANNER)
         parser.print_help()
-        return
+        return 0
 
     dispatch = {
         "devices": cmd_devices,
@@ -669,10 +622,11 @@ def main():
 
     handler = dispatch.get(args.command)
     if handler:
-        handler(args)
+        return handler(args)
     else:
         parser.print_help()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
